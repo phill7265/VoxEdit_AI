@@ -1,0 +1,98 @@
+{
+  "$schema": "https://voxedit.ai/schemas/handover_note/v1",
+  "schema_version": "1.0.0",
+
+  "session": {
+    "job_id": "job_20260418_001",
+    "session_id": "sess_20260418_143022",
+    "agent_id": "pipeline_runner_v1",
+    "started_at": "2026-04-18T14:30:22Z",
+    "closed_at": "2026-04-18T15:10:47Z",
+    "close_reason": "session_end"
+  },
+
+  "progress": {
+    "last_cursor": "00:02:15",
+    "total_duration": "00:08:42",
+    "completion_pct": 25.8
+  },
+
+  "applied_edits": [
+    {
+      "id": "edit_001",
+      "skill": "cutter",
+      "action": "cut_silence",
+      "segment": { "start": "00:00:00", "end": "00:02:15" },
+      "detail": "Removed 4 silence gaps >= 0.5s; total 3.2s trimmed",
+      "output_path": "staging/001_cutter_seg01.edl",
+      "quality_gate_passed": true
+    },
+    {
+      "id": "edit_002",
+      "skill": "designer",
+      "action": "added_caption_01",
+      "segment": { "start": "00:00:08", "end": "00:00:21" },
+      "detail": "Lower-third caption: 'Intro segment'",
+      "output_path": "staging/002_designer_caption01.json",
+      "quality_gate_passed": true
+    }
+  ],
+
+  "pending_tasks": [
+    {
+      "id": "task_001",
+      "skill": "designer",
+      "action": "bgm_mixing",
+      "segment": { "start": "00:02:15", "end": "00:08:42" },
+      "detail": "Audio ducking not yet applied to remaining runtime",
+      "blocked_by": null,
+      "priority": "high"
+    },
+    {
+      "id": "task_002",
+      "skill": "cutter",
+      "action": "cut_silence",
+      "segment": { "start": "00:02:15", "end": "00:08:42" },
+      "detail": "Silence removal pending for segments 2–end",
+      "blocked_by": null,
+      "priority": "high"
+    },
+    {
+      "id": "task_003",
+      "skill": "exporter",
+      "action": "final_render",
+      "segment": { "start": "00:00:00", "end": "00:08:42" },
+      "detail": "Blocked until all upstream skills complete",
+      "blocked_by": ["task_001", "task_002"],
+      "priority": "normal"
+    }
+  ],
+
+  "quality_score": 0.95,
+  "quality_breakdown": {
+    "audio_sync": 1.0,
+    "silence_removal": 0.95,
+    "resolution": 1.0,
+    "jump_cut_zoom": null,
+    "audio_ducking": null
+  },
+
+  "context_snapshot": {
+    "active_spec_version": "0.2.0",
+    "source_file": "raw/interview_20260418.mp4",
+    "transcript_path": "staging/transcript.json",
+    "timeline_path": "staging/timeline_v3.json",
+    "style_overrides": []
+  },
+
+  "sandbox_state": {
+    "staged_files": [
+      "staging/001_cutter_seg01.edl",
+      "staging/002_designer_caption01.json"
+    ],
+    "committed_to_timeline": true,
+    "rollback_available": false
+  },
+
+  "resume_instruction": "On next session load, read this file first. Resume from pending_tasks[0] (task_001: bgm_mixing) starting at last_cursor 00:02:15. Re-inject context_snapshot fields into pipeline context firewall. Do NOT re-run any edit listed in applied_edits."
+}
