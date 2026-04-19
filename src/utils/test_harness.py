@@ -423,12 +423,16 @@ class TestBuildSkillContextCutter(unittest.TestCase):
         self.assertIsInstance(ctx, CutterContext)
         self.assertEqual(len(ctx.transcript_window), 2)
 
-    def test_words_outside_window_are_excluded(self) -> None:
-        """Cursor=60s, window=[30,90]s. Words at 10s and 120s must be excluded."""
+    def test_cutter_sees_full_transcript(self) -> None:
+        """Cutter always receives the full transcript regardless of cursor position.
+
+        Unlike Designer/Exporter which use a 30s sliding window, Cutter needs all
+        words to make global cut decisions. The window is set to [0, total_duration].
+        """
         words = _transcript_words([
-            (10_000, 11_000, "before"),    # midpoint 10.5 s — outside
-            (50_000, 51_000, "inside"),    # midpoint 50.5 s — inside
-            (120_000, 121_000, "after"),   # midpoint 120.5 s — outside
+            (10_000, 11_000, "early"),     # midpoint 10.5 s
+            (50_000, 51_000, "middle"),    # midpoint 50.5 s
+            (120_000, 121_000, "late"),    # midpoint 120.5 s
         ])
         path = self._write_transcript(words)
         ctx = build_skill_context(
@@ -438,16 +442,14 @@ class TestBuildSkillContextCutter(unittest.TestCase):
             transcript_path=path,
         )
         window_words = [w["word"] for w in ctx.transcript_window]
-        self.assertIn("inside", window_words)
-        self.assertNotIn("before", window_words)
-        self.assertNotIn("after", window_words)
+        self.assertIn("early", window_words)
+        self.assertIn("middle", window_words)
+        self.assertIn("late", window_words)
 
     def test_window_exactly_30s_boundary(self) -> None:
-        """Word at cursor − 30 s (boundary) must be included."""
-        cursor_s = 90.0   # 1:30.000
-        boundary_mid_ms = int((cursor_s - 30.0) * 1000)   # exactly 60_000 ms
+        """All words within total duration are included for cutter."""
         words = _transcript_words([
-            (boundary_mid_ms - 500, boundary_mid_ms + 500, "boundary"),
+            (60_000, 61_000, "boundary"),  # at 60s within 10-minute video
         ])
         path = self._write_transcript(words)
         ctx = build_skill_context(
@@ -710,10 +712,11 @@ class TestHarnessIntegration(unittest.TestCase):
     def test_resume_cursor_becomes_cutter_window_center(self) -> None:
         """
         Scenario:
-          1. transcriber succeeded, cursor_end = 00:02:00.000
+          1. transcriber succeeded, cursor_end = 00:02:00.000 (transcript end)
           2. cutter failed
           → resume_point.cursor = 00:02:00.000
-          → CutterContext window should be [00:01:30, 00:02:30]
+          → CutterContext sees full transcript [0, total_duration] regardless of
+            cursor position, because Cutter needs all words for global cut decisions.
         """
         mgr = MemoryManager("job_integration_001")
         mgr.write(_make_record(
@@ -729,11 +732,10 @@ class TestHarnessIntegration(unittest.TestCase):
         self.assertEqual(resume.next_skill, "cutter")
         self.assertEqual(resume.cursor, "00:02:00.000")
 
-        # Words at 60s (outside) and 100s (inside) relative to cursor=120s
         words = _transcript_words([
-            (60_000, 61_000, "too_early"),    # midpoint 60.5 s < 90 s (cursor−30)
-            (100_000, 101_000, "in_window"),  # midpoint 100.5 s ∈ [90, 150]
-            (200_000, 201_000, "too_late"),   # midpoint 200.5 s > 150 s (cursor+30)
+            (60_000, 61_000, "early"),     # 60.5 s
+            (100_000, 101_000, "middle"),  # 100.5 s
+            (200_000, 201_000, "late"),    # 200.5 s
         ])
         transcript_path = self._write_transcript(words)
 
@@ -745,9 +747,9 @@ class TestHarnessIntegration(unittest.TestCase):
         )
 
         window_words = [w["word"] for w in ctx.transcript_window]
-        self.assertIn("in_window", window_words)
-        self.assertNotIn("too_early", window_words)
-        self.assertNotIn("too_late", window_words)
+        self.assertIn("early", window_words)
+        self.assertIn("middle", window_words)
+        self.assertIn("late", window_words)
 
     def test_complete_job_produces_no_next_skill(self) -> None:
         mgr = MemoryManager("job_integration_002")

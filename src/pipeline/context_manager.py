@@ -128,6 +128,11 @@ class ExporterContext:
 _spec_cache: dict[str, Any] = {}
 
 
+def clear_spec_cache() -> None:
+    """Invalidate the module-level spec cache so next _load_spec() re-reads the file."""
+    _spec_cache.clear()
+
+
 def _load_spec() -> dict[str, Any]:
     """Return parsed editing rules from spec/editing_style.md.
 
@@ -160,6 +165,14 @@ def _load_spec() -> dict[str, Any]:
 def _parse_spec_into(text: str, out: dict[str, Any]) -> None:
     """Extract numeric values from editing_style.md into `out`."""
     import re
+
+    # Key-value overrides written by IntentProcessor take highest precedence
+    kv_override = re.search(r"SILENCE_MIN_DURATION_S\s*[:=]\s*(\d+\.?\d*)", text)
+    if kv_override:
+        try:
+            out["silence_threshold_s"] = float(kv_override.group(1))
+        except ValueError:
+            pass
 
     patterns = {
         "silence_threshold_s": r"Detection threshold.*?(\d+\.?\d*)\s*s",
@@ -310,8 +323,14 @@ def build_skill_context(
         )
 
     elif skill_name == "cutter":
+        # The cutter is rule-based and must see the full transcript.
+        # Centering the window at total_s/2 with half_window=total_s/2
+        # always gives [0, total_s], regardless of where the cursor is.
+        # (Cursor after Transcriber is the transcript end, which would
+        # otherwise push the 30 s window past the start of the video.)
+        _cutter_half = total_s / 2.0
         words, win_start, win_end = _slice_transcript(
-            transcript_path, cursor_s, CUTTER_WINDOW_S, total_s
+            transcript_path, _cutter_half, _cutter_half, total_s
         )
         ctx = CutterContext(
             cursor=cursor,

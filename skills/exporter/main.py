@@ -226,6 +226,11 @@ def run(
 
     # ── Execute (unless dry_run) ──────────────────────────────────────────
     if not dry_run:
+        # Remove any partial output from a previous failed/killed run so FFmpeg
+        # does not silently refuse to overwrite (it has no -y flag).
+        if output_video.exists():
+            output_video.unlink()
+            logger.info("Exporter: removed stale output file before render")
         exec_result = sandbox.run(ffmpeg_cmd, source_file or "", dry_run=False)
         if not exec_result.success:
             error_msg = (

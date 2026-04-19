@@ -94,3 +94,12 @@ These are the pass/fail conditions checked by `harness/sensors/` after each skil
 | DURATION | All clips ≥ 0.5s | Merge with adjacent clip |
 | JUMP_CUT_ZOOM | 1.1× scale applied to all jump cuts | Re-run designer on segment |
 | DUCK_LEVEL | Music ducked to ≤ original − 20 dB during speech | Re-run audio mix |
+
+
+## 6. Caption Position
+
+| Parameter | Value |
+|-----------|-------|
+| CAPTION_Y_PX: 768 | Default subtitle Y coordinate (84% of 1920px height) |
+HIGHLIGHT_COLOR: #FFD700
+CAPTION_COLOR: #FFFFFF

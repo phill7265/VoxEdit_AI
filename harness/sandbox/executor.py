@@ -35,10 +35,15 @@ logger = logging.getLogger(__name__)
 STAGING_ROOT = Path(__file__).resolve().parents[2] / "staging"
 
 # Resource limits
-CPU_LIMIT_PCT: float = 85.0        # kill if process exceeds this % for sustained period
-MEMORY_LIMIT_MB: float = 2048.0    # kill if RSS exceeds this
+# psutil.cpu_percent() for a process returns usage across ALL logical cores
+# (e.g. 800% on an 8-core machine is 100% of one core × 8).
+# Set the limit to 95% × logical_core_count so FFmpeg can saturate all cores
+# while still catching runaway/infinite-loop processes.
+import psutil as _psutil
+CPU_LIMIT_PCT: float = 95.0 * (_psutil.cpu_count() or 4)
+MEMORY_LIMIT_MB: float = 4096.0   # raised: HEVC→H.264 decode+encode is memory-hungry
 RESOURCE_POLL_INTERVAL_S: float = 2.0
-CPU_SUSTAINED_SECONDS: float = 10.0  # must exceed CPU limit for this long before kill
+CPU_SUSTAINED_SECONDS: float = 30.0  # sustained period before kill
 
 
 # ---------------------------------------------------------------------------

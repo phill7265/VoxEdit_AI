@@ -92,9 +92,14 @@ class WorkflowManager:
     language        : Language hint for Transcriber (None = auto).
     model_name      : Whisper model name (default "base").
     export_profile  : Override export settings dict passed to Exporter.
-    dry_run         : If True, Exporter validates FFmpeg command but does not render.
-    skill_overrides : Dict of skill → kwarg dict for low-level test overrides.
-                      E.g. {"transcriber": {"backend": mock_backend}}
+    dry_run           : If True, Exporter validates FFmpeg command but does not render.
+    skill_overrides   : Dict of skill → kwarg dict for low-level test overrides.
+                        E.g. {"transcriber": {"backend": mock_backend}}
+    force_resume_from : Smart Resume — skip all skills BEFORE this one even if they
+                        have no records in this job, borrowing outputs from
+                        borrow_records instead.  E.g. "exporter" re-renders only.
+    borrow_records    : SkillRecords from a prior job to use as prior_output() sources
+                        for any skill before force_resume_from.
     """
 
     def __init__(
@@ -108,6 +113,8 @@ class WorkflowManager:
         export_profile: Optional[dict] = None,
         dry_run: bool = False,
         skill_overrides: Optional[dict[str, dict]] = None,
+        force_resume_from: Optional[str] = None,
+        borrow_records: Optional[dict[str, "SkillRecord"]] = None,
     ) -> None:
         self.job_id = job_id
         self.source_file = source_file
@@ -117,6 +124,8 @@ class WorkflowManager:
         self.export_profile = export_profile
         self.dry_run = dry_run
         self.skill_overrides = skill_overrides or {}
+        self.force_resume_from = force_resume_from
+        self.borrow_records: dict[str, SkillRecord] = borrow_records or {}
 
     # ── Public API ─────────────────────────────────────────────────────────
 
@@ -129,6 +138,9 @@ class WorkflowManager:
         """
         mgr = MemoryManager(self.job_id)
         resume = mgr.find_resume_point()
+
+        if self.force_resume_from and self.force_resume_from in SKILL_ORDER:
+            resume = self._apply_force_resume(resume, mgr)
 
         result = PipelineResult(
             job_id=self.job_id,
@@ -183,6 +195,55 @@ class WorkflowManager:
             self.job_id, result.completed,
         )
         return result
+
+    # ── Smart Resume ────────────────────────────────────────────────────────
+
+    def _apply_force_resume(self, resume, mgr: MemoryManager):
+        """Inject borrow_records for skills before force_resume_from.
+
+        Writes placeholder SkillRecords to this job's memory dir so that
+        MEMORY_CONSISTENCY checks see a full 4-skill success set.
+        Then forces resume.next_skill = force_resume_from.
+        """
+        from dataclasses import asdict
+        forced_idx = SKILL_ORDER.index(self.force_resume_from)
+
+        for skill in SKILL_ORDER[:forced_idx]:
+            if skill in resume.completed:
+                continue  # already in this job — keep it
+            src = self.borrow_records.get(skill)
+            if src is None:
+                logger.warning(
+                    "WorkflowManager: force_resume_from=%s but no borrow_record for '%s' — "
+                    "pipeline will run from transcriber instead",
+                    self.force_resume_from, skill,
+                )
+                return resume  # fall back to normal resume
+
+            placeholder = SkillRecord(
+                job_id=self.job_id,
+                skill=skill,
+                status="success",
+                output_path=src.output_path,
+                cursor_start=src.cursor_start,
+                cursor_end=src.cursor_end,
+                payload={"borrowed_from_job": src.job_id},
+            )
+            mgr.write(placeholder)
+            resume.records[skill] = placeholder
+
+        resume.completed = [s for s in SKILL_ORDER[:forced_idx] if s in resume.records]
+        resume.next_skill = self.force_resume_from
+        if resume.completed:
+            resume.cursor = resume.records[resume.completed[-1]].cursor_end
+        else:
+            resume.cursor = "00:00:00.000"
+
+        logger.info(
+            "WorkflowManager: smart resume — force_from=%s  borrowed=%s  cursor=%s",
+            self.force_resume_from, list(resume.completed), resume.cursor,
+        )
+        return resume
 
     # ── Skill dispatch ──────────────────────────────────────────────────────
 

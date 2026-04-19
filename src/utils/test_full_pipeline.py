@@ -767,7 +767,9 @@ class TestBuildExportPlan(unittest.TestCase):
         self.assertEqual(len(plan.zoom_elements), 1)
 
     def test_duck_extracted(self):
-        ve = [{"type": "duck", "start": 1.0, "end": 2.5}]
+        # Duck must be in the deleted/silence region (3.0-5.0) to pass the
+        # "don't duck speech" filter; overlapping a keep segment is filtered out.
+        ve = [{"type": "duck", "start": 3.2, "end": 4.8}]
         plan = build_export_plan(self._segs(), ve, source_file="s", output_file="o")
         self.assertEqual(len(plan.duck_events), 1)
 

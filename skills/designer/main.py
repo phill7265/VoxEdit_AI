@@ -33,6 +33,8 @@ from skills.designer.logic import (
     run_designer,
 )
 
+_BROLL_REQUESTS_FILE = Path(__file__).resolve().parents[2] / "spec" / "broll_requests.json"
+
 logger = logging.getLogger(__name__)
 
 # ── Defaults ──────────────────────────────────────────────────────────────
@@ -209,6 +211,15 @@ def run(
         except Exception as exc:
             logger.warning("Designer: transcript load failed (%s) — continuing without captions", exc)
 
+    # ── Load b-roll requests ──────────────────────────────────────────────
+    broll_requests: list[dict] = []
+    if _BROLL_REQUESTS_FILE.exists():
+        try:
+            broll_requests = json.loads(_BROLL_REQUESTS_FILE.read_text(encoding="utf-8"))
+            logger.info("Designer: loaded %d b-roll request(s)", len(broll_requests))
+        except Exception as exc:
+            logger.warning("Designer: failed to load broll_requests.json — %s", exc)
+
     # ── Execute designer logic ────────────────────────────────────────────
     try:
         result: DesignerResult = run_designer(
@@ -216,6 +227,7 @@ def run(
             cut_segments,
             vad_segments,
             keywords=kw,
+            broll_requests=broll_requests if broll_requests else None,
         )
     except Exception as exc:
         error_detail = traceback.format_exc()
@@ -261,6 +273,7 @@ def run(
                 "duck_event_count": len(result.duck_events),
                 "highlight_count": len(result.highlights),
                 "overlay_count": len(result.overlays),
+                "broll_count": len(result.brolls),
                 "sensor_flags": result.sensor_flags,
             },
         },
@@ -270,11 +283,12 @@ def run(
     mgr.write(record)
     logger.info(
         "Designer handover committed — job=%s  captions=%d  zooms=%d  "
-        "ducks=%d  highlights=%d",
+        "ducks=%d  highlights=%d  brolls=%d",
         job_id,
         len(result.captions),
         len(result.zooms),
         len(result.duck_events),
         len(result.highlights),
+        len(result.brolls),
     )
     return record

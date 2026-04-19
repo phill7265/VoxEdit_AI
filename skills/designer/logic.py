@@ -145,6 +145,12 @@ class VisualElement:
     attack_ms: float = DUCK_ATTACK_MS
     release_ms: float = DUCK_RELEASE_MS
 
+    # b-roll ────────────────────────────────────────────────────────────────
+    asset_path: str = ""        # absolute path to b-roll video file
+    opacity: float = 1.0        # 0.0–1.0; <1.0 blends over main; 1.0 replaces
+    broll_mode: str = "overlay" # "overlay" | "replace"
+    keyword: str = ""           # source keyword used to select this asset
+
     @property
     def duration_s(self) -> float:
         return self.end - self.start
@@ -179,6 +185,13 @@ class VisualElement:
                 "attack_ms": self.attack_ms,
                 "release_ms": self.release_ms,
             })
+        elif self.type == "b-roll":
+            d.update({
+                "asset_path": self.asset_path,
+                "opacity": round(self.opacity, 3),
+                "broll_mode": self.broll_mode,
+                "keyword": self.keyword,
+            })
         return d
 
 
@@ -204,6 +217,10 @@ class DesignerResult:
     @property
     def duck_events(self) -> list[VisualElement]:
         return [e for e in self.visual_elements if e.type == "duck"]
+
+    @property
+    def brolls(self) -> list[VisualElement]:
+        return [e for e in self.visual_elements if e.type == "b-roll"]
 
     @property
     def highlights(self) -> list[VisualElement]:
@@ -458,6 +475,63 @@ def build_duck_events(
     return events
 
 
+# ── B-roll element builder ────────────────────────────────────────────────
+
+def build_broll_elements(
+    broll_requests: list[dict],
+    *,
+    total_duration_s: float,
+) -> list[VisualElement]:
+    """Convert IntentProcessor b-roll requests to VisualElements.
+
+    Each request dict has:
+      keyword    : str   — label used to find the asset
+      asset_path : str   — absolute path to the video file
+      start_s    : float — output-timeline start (default: 0.25 × total)
+      end_s      : float — output-timeline end   (default: start + min(5, 0.5×total))
+      opacity    : float — 0.0–1.0 (default 1.0)
+      mode       : str   — "overlay" | "replace" (default "overlay")
+
+    Requests with a missing or non-existent asset_path are skipped with a warning.
+    """
+    from pathlib import Path as _Path
+
+    elements: list[VisualElement] = []
+    for req in broll_requests:
+        asset = req.get("asset_path", "")
+        if not asset or not _Path(asset).exists():
+            logger.warning(
+                "build_broll_elements: asset not found, skipping — %s", asset
+            )
+            continue
+
+        default_start = round(total_duration_s * 0.25, 3)
+        default_dur = min(5.0, total_duration_s * 0.5)
+        start_s = float(req.get("start_s", default_start))
+        end_s = float(req.get("end_s", start_s + default_dur))
+        # Clamp to valid output range
+        end_s = min(end_s, total_duration_s)
+        start_s = min(start_s, end_s - 0.5)
+
+        elements.append(VisualElement(
+            type="b-roll",
+            start=round(start_s, 3),
+            end=round(end_s, 3),
+            asset_path=asset,
+            opacity=float(req.get("opacity", 1.0)),
+            broll_mode=req.get("mode", "overlay"),
+            keyword=req.get("keyword", ""),
+        ))
+        logger.info(
+            "b-roll element: keyword=%s  %.3f–%.3f s  opacity=%.2f  mode=%s",
+            req.get("keyword", ""), start_s, end_s,
+            float(req.get("opacity", 1.0)), req.get("mode", "overlay"),
+        )
+
+    logger.info("build_broll_elements: %d elements produced", len(elements))
+    return elements
+
+
 # ── Sensor validation ─────────────────────────────────────────────────────
 
 def _run_designer_sensors(
@@ -518,6 +592,7 @@ def run_designer(
     duck_db: float = DUCK_DB,
     attack_ms: float = DUCK_ATTACK_MS,
     release_ms: float = DUCK_RELEASE_MS,
+    broll_requests: Optional[list[dict]] = None,
 ) -> DesignerResult:
     """Full Designer pipeline for one context window.
 
@@ -574,6 +649,17 @@ def run_designer(
             release_ms=release_ms,
         )
     )
+
+    # ── 4. B-roll overlays (from IntentProcessor requests) ────────────────
+    if broll_requests:
+        total_dur = sum(
+            max(0.0, seg.get("end", 0.0) - seg.get("start", 0.0))
+            for seg in cut_segments
+            if seg.get("action") == "keep"
+        ) or 30.0  # fallback if no cut segments
+        result.visual_elements.extend(
+            build_broll_elements(broll_requests, total_duration_s=total_dur)
+        )
 
     # Sort all elements by start time for deterministic output
     result.visual_elements.sort(key=lambda e: e.start)

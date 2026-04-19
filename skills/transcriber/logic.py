@@ -320,7 +320,7 @@ class RealWhisperBackend:
         if self._model is None:
             raise RuntimeError("Call load() before transcribe()")
 
-        options: dict[str, Any] = {"word_timestamps": word_timestamps}
+        options: dict[str, Any] = {"word_timestamps": word_timestamps, "fp16": False}
         if language:
             options["language"] = language
 
