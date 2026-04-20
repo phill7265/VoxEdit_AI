@@ -33,6 +33,21 @@ _SPEC_FILE = _ROOT / "spec" / "editing_style.md"
 _BROLL_REQUESTS_FILE = _ROOT / "spec" / "broll_requests.json"
 _ASSETS_BROLL_DIR = _ROOT / "assets" / "broll"
 _JOBS_ROOT = _ROOT / "harness" / "memory" / "jobs"
+_AUDIO_STYLE_FILE = _ROOT / "spec" / "audio_style.md"
+
+# ── Korean/Arabic ordinal → 1-based integer ──────────────────────────────────
+_ORDINAL_MAP: dict[str, int] = {
+    "첫": 1, "하나": 1, "한": 1, "일": 1, "1": 1,
+    "둘": 2, "두": 2, "이": 2, "2": 2,
+    "셋": 3, "세": 3, "삼": 3, "3": 3,
+    "넷": 4, "네": 4, "사": 4, "4": 4,
+    "다섯": 5, "오": 5, "5": 5,
+    "여섯": 6, "육": 6, "6": 6,
+    "일곱": 7, "칠": 7, "7": 7,
+    "여덟": 8, "팔": 8, "8": 8,
+    "아홉": 9, "구": 9, "9": 9,
+    "열": 10, "십": 10, "10": 10,
+}
 
 # ── Korean stop words for noun extraction ─────────────────────────────────────
 _STOP_WORDS: frozenset[str] = frozenset({
@@ -131,6 +146,35 @@ def _read_float(field_name: str, default: float) -> float:
 def _read_str(field_name: str, default: str) -> str:
     raw = _read_spec_value(field_name)
     return raw.strip() if raw else default
+
+
+# ── Audio style I/O ───────────────────────────────────────────────────────────
+
+def _read_audio_float(field_name: str, default: float) -> float:
+    try:
+        text = _AUDIO_STYLE_FILE.read_text(encoding="utf-8")
+        m = re.search(rf"{re.escape(field_name)}\s*[:=]\s*([+-]?[\d.]+)", text)
+        return float(m.group(1)) if m else default
+    except Exception:
+        return default
+
+
+def _write_audio_value(field_name: str, value: str) -> None:
+    """Upsert a `FIELD: value` line in audio_style.md."""
+    try:
+        text = _AUDIO_STYLE_FILE.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        text = "# VoxEdit AI — Audio Style\n\n"
+    new_fragment = f"{field_name}: {value}"
+    if field_name in text:
+        text = re.sub(
+            rf"{re.escape(field_name)}\s*[:=]\s*[^\|\n]+",
+            new_fragment,
+            text,
+        )
+    else:
+        text = text.rstrip() + f"\n{new_fragment}\n"
+    _AUDIO_STYLE_FILE.write_text(text, encoding="utf-8")
 
 
 # ── Intent handlers ───────────────────────────────────────────────────────────
@@ -352,6 +396,106 @@ def _handle_broll_remove(text: str) -> IntentResult:
     )
 
 
+def _parse_ordinal(text: str) -> int | None:
+    """Extract a 1-based ordinal from text.  Returns None for 'last'/'마지막'.
+
+    Accepts Arabic digits ("2번"), Korean numerals ("두번째"), or "마지막".
+    Returns -1 as the sentinel for "last" / "마지막".
+    """
+    if re.search(r"마지막|last|최후|끝", text):
+        return -1  # sentinel for "last"
+    # Arabic digits first ("2번째" → 2)
+    m = re.search(r"(\d+)번", text)
+    if m:
+        return int(m.group(1))
+    # Korean ordinal words
+    for word, idx in sorted(_ORDINAL_MAP.items(), key=lambda kv: -len(kv[0])):
+        if word in text:
+            return idx
+    return None
+
+
+def _handle_broll_delete_by_index(text: str) -> IntentResult:
+    """Delete the N-th b-roll entry: '2번 자료화면 빼줘'."""
+    idx = _parse_ordinal(text)
+    if idx is None:
+        return IntentResult(
+            summary="삭제할 번호를 인식하지 못했습니다. 예: '2번 자료화면 빼줘'",
+            changes={}, restart_from="designer_fast", applied=False,
+        )
+    requests = _read_broll_requests()
+    if not requests:
+        return IntentResult(
+            summary="삭제할 자료화면이 없습니다.",
+            changes={}, restart_from="designer_fast", applied=False,
+        )
+    target = len(requests) - 1 if idx == -1 else idx - 1   # 0-based
+    if target < 0 or target >= len(requests):
+        return IntentResult(
+            summary=f"인덱스 {idx}이(가) 범위를 벗어났습니다 (총 {len(requests)}개).",
+            changes={}, restart_from="designer_fast", applied=False,
+        )
+    removed = requests.pop(target)
+    _write_broll_requests(requests)
+    label = "마지막" if idx == -1 else f"{idx}번"
+    return IntentResult(
+        summary=f"자료화면 {label} 삭제: '{removed.get('keyword', '?')}'",
+        changes={"BROLL_REQUESTS": None},
+        restart_from="designer_fast",
+    )
+
+
+def _handle_broll_reroll_by_index(text: str) -> IntentResult:
+    """Re-generate the N-th b-roll asset: '마지막 그림 다시 그려줘'."""
+    from src.utils.asset_generator import AssetGenerator
+
+    idx = _parse_ordinal(text)
+    if idx is None:
+        return IntentResult(
+            summary="재생성할 번호를 인식하지 못했습니다. 예: '마지막 그림 다시 그려줘'",
+            changes={}, restart_from="designer_fast", applied=False,
+        )
+    requests = _read_broll_requests()
+    if not requests:
+        return IntentResult(
+            summary="재생성할 자료화면이 없습니다.",
+            changes={}, restart_from="designer_fast", applied=False,
+        )
+    target = len(requests) - 1 if idx == -1 else idx - 1
+    if target < 0 or target >= len(requests):
+        return IntentResult(
+            summary=f"인덱스 {idx}이(가) 범위를 벗어났습니다 (총 {len(requests)}개).",
+            changes={}, restart_from="designer_fast", applied=False,
+        )
+
+    req = requests[target]
+    keyword = req.get("keyword", "")
+
+    # Delete cached file so AssetGenerator regenerates it
+    generator = AssetGenerator()
+    cached = generator.cache_path(keyword)
+    if cached.exists():
+        cached.unlink()
+
+    # Regenerate
+    new_path = generator.generate(keyword)
+    if not new_path:
+        return IntentResult(
+            summary=f"'{keyword}' 에셋 재생성에 실패했습니다.",
+            changes={}, restart_from="designer_fast", applied=False,
+        )
+
+    requests[target]["asset_path"] = new_path
+    _write_broll_requests(requests)
+
+    label = "마지막" if idx == -1 else f"{idx}번"
+    return IntentResult(
+        summary=f"자료화면 {label} 재생성 완료: '{keyword}' → {Path(new_path).name}",
+        changes={"BROLL_REQUESTS": requests[target]},
+        restart_from="designer_fast",
+    )
+
+
 def _load_latest_transcript_words() -> list[dict]:
     """Scan harness/memory/jobs/ and return words from the most recent successful transcriber."""
     import json as _json
@@ -391,8 +535,14 @@ def _extract_noun_candidates(words: list[dict], max_candidates: int = 20) -> lis
 
 
 def _handle_broll_auto_fill(_text: str) -> IntentResult:
-    """Auto-match b-roll assets from transcript nouns via AssetIndexer."""
+    """Auto-match b-roll assets from transcript nouns via AssetIndexer.
+
+    Falls back to AssetGenerator for keywords with no local match.
+    Generated images are saved to assets/generated/ and registered in
+    broll_requests.json.  Smart Resume restarts from Designer.
+    """
     from src.utils.asset_indexer import AssetIndexer
+    from src.utils.asset_generator import AssetGenerator
 
     # Load the most recent successful transcript
     words = _load_latest_transcript_words()
@@ -409,15 +559,24 @@ def _handle_broll_auto_fill(_text: str) -> IntentResult:
 
     candidates = _extract_noun_candidates(words)
 
-    indexer = AssetIndexer()
+    # Attach generator as fallback — "auto" uses Replicate if API token is set,
+    # otherwise falls back to placeholder (no API call).
+    generator = AssetGenerator()
+    indexer = AssetIndexer(generator=generator)
     indexer.build()
 
     matched: list[dict] = []
     seen_paths: set[str] = set()
+    generated_count = 0
+
     for word in candidates:
         path = indexer.find(word)
         if path and path not in seen_paths:
             seen_paths.add(path)
+            # Detect whether this path came from the generator
+            is_generated = "generated" in path.replace("\\", "/")
+            if is_generated:
+                generated_count += 1
             matched.append({
                 "keyword": word,
                 "asset_path": path,
@@ -428,8 +587,8 @@ def _handle_broll_auto_fill(_text: str) -> IntentResult:
     if not matched:
         return IntentResult(
             summary=(
-                "트랜스크립트 명사와 일치하는 에셋이 assets/broll/에 없습니다. "
-                "assets/broll/ 폴더에 영상 파일을 추가한 후 다시 시도하세요."
+                "트랜스크립트 명사와 일치하는 에셋이 없고 생성에도 실패했습니다. "
+                "assets/broll/에 파일을 추가하거나 REPLICATE_API_TOKEN을 설정하세요."
             ),
             changes={},
             restart_from="designer",
@@ -443,10 +602,128 @@ def _handle_broll_auto_fill(_text: str) -> IntentResult:
     _write_broll_requests(merged)
 
     summary_items = [f"'{m['keyword']}'" for m in matched]
+    gen_note = f" (생성됨: {generated_count}개)" if generated_count else ""
     return IntentResult(
-        summary=f"자동 매칭 완료: {', '.join(summary_items)} ({len(matched)}개 에셋)",
+        summary=f"자동 매칭 완료: {', '.join(summary_items)} ({len(matched)}개 에셋{gen_note})",
         changes={"BROLL_REQUESTS": matched},
         restart_from="designer",
+    )
+
+
+def _handle_more_dynamic(_text: str) -> IntentResult:
+    """'좀 더 역동적으로' / '더 활발하게' — increase RHYTHM_INTENSITY."""
+    current = _read_float("RHYTHM_INTENSITY", 0.5)
+    new_val = round(min(1.0, current + 0.2), 2)
+    _write_spec_value("RHYTHM_INTENSITY", f"{new_val:.2f}")
+    return IntentResult(
+        summary=f"리듬 강도 {current:.2f} → {new_val:.2f} (+0.2) — DynamicZoom 강화",
+        changes={"RHYTHM_INTENSITY": new_val},
+        restart_from="visual_fast",
+    )
+
+
+def _handle_less_dynamic(_text: str) -> IntentResult:
+    """'좀 차분하게' / '덜 역동적으로' — decrease RHYTHM_INTENSITY."""
+    current = _read_float("RHYTHM_INTENSITY", 0.5)
+    new_val = round(max(0.0, current - 0.2), 2)
+    _write_spec_value("RHYTHM_INTENSITY", f"{new_val:.2f}")
+    return IntentResult(
+        summary=f"리듬 강도 {current:.2f} → {new_val:.2f} (-0.2) — DynamicZoom 약화",
+        changes={"RHYTHM_INTENSITY": new_val},
+        restart_from="visual_fast",
+    )
+
+
+def _handle_shake_screen(_text: str) -> IntentResult:
+    """'화면 흔들어줘' / '강하게 줌' — set RHYTHM_INTENSITY to high."""
+    _write_spec_value("RHYTHM_INTENSITY", "0.80")
+    return IntentResult(
+        summary="화면 역동성 강화 (RHYTHM_INTENSITY=0.80)",
+        changes={"RHYTHM_INTENSITY": 0.80},
+        restart_from="visual_fast",
+    )
+
+
+def _handle_focus_here(_text: str) -> IntentResult:
+    """'여기에 집중해줘' — enable focus zoom and increase intensity slightly."""
+    current = _read_float("RHYTHM_INTENSITY", 0.5)
+    new_val = round(min(1.0, max(0.6, current + 0.1)), 2)
+    _write_spec_value("RHYTHM_INTENSITY", f"{new_val:.2f}")
+    _write_spec_value("ZOOM_FOCUS_ENABLED", "true")
+    return IntentResult(
+        summary=f"집중 연출 활성화 (RHYTHM_INTENSITY={new_val:.2f}, ZOOM_FOCUS_ENABLED=true)",
+        changes={"RHYTHM_INTENSITY": new_val, "ZOOM_FOCUS_ENABLED": "true"},
+        restart_from="visual_fast",
+    )
+
+
+def _handle_bgm_louder(_text: str) -> IntentResult:
+    """'음악 크게' / 'BGM 키워줘' — increase BGM_BASE_VOLUME."""
+    current = _read_audio_float("BGM_BASE_VOLUME", 0.30)
+    new_val = round(min(1.0, current + 0.1), 2)
+    _write_audio_value("BGM_BASE_VOLUME", f"{new_val:.2f}")
+    return IntentResult(
+        summary=f"BGM 볼륨 {current:.2f} → {new_val:.2f} (+10%)",
+        changes={"BGM_BASE_VOLUME": new_val},
+        restart_from="audio_only",
+    )
+
+
+def _handle_bgm_quieter(_text: str) -> IntentResult:
+    """'음악 작게' / 'BGM 낮춰줘' — decrease BGM_BASE_VOLUME."""
+    current = _read_audio_float("BGM_BASE_VOLUME", 0.30)
+    new_val = round(max(0.0, current - 0.1), 2)
+    _write_audio_value("BGM_BASE_VOLUME", f"{new_val:.2f}")
+    return IntentResult(
+        summary=f"BGM 볼륨 {current:.2f} → {new_val:.2f} (-10%)",
+        changes={"BGM_BASE_VOLUME": new_val},
+        restart_from="audio_only",
+    )
+
+
+def _handle_bgm_off(_text: str) -> IntentResult:
+    """'BGM 꺼줘' / '음악 없애줘' — mute BGM."""
+    _write_audio_value("BGM_BASE_VOLUME", "0.00")
+    _write_audio_value("BGM_STYLE", "off")
+    return IntentResult(
+        summary="BGM 꺼짐 (BGM_BASE_VOLUME=0.00)",
+        changes={"BGM_BASE_VOLUME": 0.0, "BGM_STYLE": "off"},
+        restart_from="audio_only",
+    )
+
+
+def _handle_bgm_calm(_text: str) -> IntentResult:
+    """'잔잔한 걸로' / '조용한 음악' — set BGM to low soft level."""
+    _write_audio_value("BGM_BASE_VOLUME", "0.15")
+    _write_audio_value("BGM_STYLE", "calm")
+    return IntentResult(
+        summary="BGM 잔잔하게 설정 (BGM_BASE_VOLUME=0.15, BGM_STYLE=calm)",
+        changes={"BGM_BASE_VOLUME": 0.15, "BGM_STYLE": "calm"},
+        restart_from="audio_only",
+    )
+
+
+def _handle_bgm_duck_stronger(_text: str) -> IntentResult:
+    """'목소리 더 잘 들리게' / '더킹 강하게' — increase VOICE_DUCK_DB magnitude."""
+    current = _read_audio_float("VOICE_DUCK_DB", -20.0)
+    new_val = round(max(-40.0, current - 6.0), 1)
+    _write_audio_value("VOICE_DUCK_DB", f"{new_val:.1f}")
+    return IntentResult(
+        summary=f"더킹 강도 {current:.1f}dB → {new_val:.1f}dB (목소리 우선도 ↑)",
+        changes={"VOICE_DUCK_DB": new_val},
+        restart_from="audio_only",
+    )
+
+
+def _handle_bgm_duck_weaker(_text: str) -> IntentResult:
+    """'BGM 더 들리게' / '더킹 약하게' — reduce VOICE_DUCK_DB magnitude."""
+    current = _read_audio_float("VOICE_DUCK_DB", -20.0)
+    new_val = round(min(-6.0, current + 6.0), 1)
+    _write_audio_value("VOICE_DUCK_DB", f"{new_val:.1f}")
+    return IntentResult(
+        summary=f"더킹 강도 {current:.1f}dB → {new_val:.1f}dB (BGM 우선도 ↑)",
+        changes={"VOICE_DUCK_DB": new_val},
+        restart_from="audio_only",
     )
 
 
@@ -525,6 +802,48 @@ _INTENT_TABLE: list[tuple[list[str], Any]] = [
         [r"침묵.{0,6}짧[게거]", r"침묵.{0,6}낮[춰워]", r"기준.{0,4}낮", r"더.{0,4}짧게\s*침묵", r"침묵\s*더\s*짧"],
         _handle_silence_shorter,
     ),
+    # ── Director's Chair — visual rhythm intents ──────────────────────────
+    (
+        [r"화면\s*(?:좀\s*)?흔들어", r"강하게\s*줌", r"쭉\s*줌", r"더\s*강하게"],
+        _handle_shake_screen,
+    ),
+    (
+        [r"여기.*집중", r"집중.*해줘", r"이\s*부분.*강조", r"포커스"],
+        _handle_focus_here,
+    ),
+    (
+        [r"(?:좀\s*)?더\s*역동적", r"역동적으로", r"더\s*활발하게", r"생동감", r"더\s*역동"],
+        _handle_more_dynamic,
+    ),
+    (
+        [r"좀\s*차분", r"덜\s*역동", r"조용하게", r"안정적으로", r"부드럽게"],
+        _handle_less_dynamic,
+    ),
+    # ── Audio / BGM interference intents ─────────────────────────────────
+    (
+        [r"BGM\s*꺼", r"음악\s*꺼", r"배경음\s*꺼", r"음악\s*없애", r"BGM\s*없애"],
+        _handle_bgm_off,
+    ),
+    (
+        [r"잔잔한", r"조용한\s*(?:음악|BGM)", r"부드러운\s*(?:음악|BGM)", r"잔잔하게"],
+        _handle_bgm_calm,
+    ),
+    (
+        [r"음악\s*크[게거]", r"BGM\s*크[게거]", r"BGM\s*키워", r"음악\s*키워", r"배경음\s*높[여이]"],
+        _handle_bgm_louder,
+    ),
+    (
+        [r"음악\s*작[게거]", r"BGM\s*작[게거]", r"BGM\s*낮[춰워]", r"음악\s*낮[춰워]", r"배경음\s*낮[춰워]"],
+        _handle_bgm_quieter,
+    ),
+    (
+        [r"더킹\s*강[하하]", r"목소리\s*더\s*잘\s*들", r"더킹\s*강[화하게]", r"ducking\s*strong"],
+        _handle_bgm_duck_stronger,
+    ),
+    (
+        [r"더킹\s*약[하하]", r"BGM\s*더\s*들[리려]", r"더킹\s*약[화하게]", r"ducking\s*weak"],
+        _handle_bgm_duck_weaker,
+    ),
     # Auto-fill must come before specific insert to avoid partial match
     (
         [
@@ -535,6 +854,22 @@ _INTENT_TABLE: list[tuple[list[str], Any]] = [
             r"자동으로\s*채워",
         ],
         _handle_broll_auto_fill,
+    ),
+    # Index-based re-roll: "마지막 그림 다시 그려줘" / "3번 자료화면 재생성"
+    (
+        [
+            r"(?:마지막|\d+번?째?|첫|두|세|네|다섯)\s*(?:자료화면|그림|b.roll|에셋)\s*(?:다시\s*)?(?:그려|재생성|만들|re.roll|재롤)",
+            r"(?:다시\s*그려|재생성|re.roll)\s*(?:마지막|\d+번?째?)",
+        ],
+        _handle_broll_reroll_by_index,
+    ),
+    # Index-based delete: "2번 자료화면 빼줘" / "마지막 그림 삭제"
+    (
+        [
+            r"(?:마지막|\d+번?째?|첫|두|세|네|다섯)\s*(?:자료화면|그림|b.roll|에셋)\s*(?:빼|삭제|제거|없애)",
+            r"(?:빼|삭제|제거)\s*(?:마지막|\d+번?째?)\s*(?:자료화면|그림)",
+        ],
+        _handle_broll_delete_by_index,
     ),
     # B-roll opacity must come before insert to avoid partial match
     (
@@ -585,11 +920,19 @@ class IntentProcessor:
 
         Rules
         -----
-        SILENCE_MIN_DURATION_S  → cutter   (structural cut-point change)
-        everything else         → exporter (visual-only, drawtext override)
+        SILENCE_MIN_DURATION_S  → cutter          (structural cut-point change)
+        BROLL_INDEX_DELETE/REROLL → designer_fast (broll patch only, skip designer)
+        everything else         → exporter        (visual-only, drawtext override)
         """
         if "SILENCE_MIN_DURATION_S" in changed_fields:
             return "cutter"
+        if any(f.startswith("BROLL_INDEX") for f in changed_fields):
+            return "designer_fast"
+        if any(f in changed_fields for f in ("RHYTHM_INTENSITY", "ZOOM_FOCUS_ENABLED")):
+            return "visual_fast"
+        if any(f in changed_fields for f in ("BGM_BASE_VOLUME", "BGM_STYLE", "VOICE_DUCK_DB",
+                                              "DUCK_ATTACK_MS", "DUCK_RELEASE_MS")):
+            return "audio_only"
         return "exporter"
 
 

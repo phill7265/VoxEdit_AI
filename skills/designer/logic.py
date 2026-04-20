@@ -30,8 +30,12 @@ src/pipeline/context_manager.py and returns typed result objects.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
+
+_SPEC_FILE = Path(__file__).resolve().parents[2] / "spec" / "editing_style.md"
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +90,20 @@ DUCK_FLOOR_DBFS: float = -40.0           # §4 absolute floor
 # ── Jump cut ───────────────────────────────────────────────────────────────
 JUMP_CUT_ZOOM: float = 1.1
 JUMP_CUT_EFFECT_KEY: str = "jump_cut_zoom_1.1"
+
+# ── Dynamic zoom ────────────────────────────────────────────────────────────
+DYNAMIC_ZOOM_MAX: float = 1.05    # maximum zoom at intensity=1.0, amplitude=1.0
+RHYTHM_INTENSITY_DEFAULT: float = 0.50
+
+
+def _read_rhythm_intensity() -> float:
+    """Read RHYTHM_INTENSITY from spec/editing_style.md (clamped to [0.0, 1.0])."""
+    try:
+        text = _SPEC_FILE.read_text(encoding="utf-8")
+        m = re.search(r"RHYTHM_INTENSITY\s*[:=]\s*([\d.]+)", text)
+        return max(0.0, min(1.0, float(m.group(1)))) if m else RHYTHM_INTENSITY_DEFAULT
+    except Exception:
+        return RHYTHM_INTENSITY_DEFAULT
 
 
 # ── Data models ───────────────────────────────────────────────────────────
@@ -534,6 +552,52 @@ def build_broll_elements(
 
 # ── Sensor validation ─────────────────────────────────────────────────────
 
+def build_dynamic_zoom_events(
+    vad_segments: list[dict],
+    *,
+    rhythm_intensity: float = RHYTHM_INTENSITY_DEFAULT,
+) -> list[VisualElement]:
+    """Build DynamicZoom events from VAD amplitude data.
+
+    Creates subtle zoom pulses synchronised to vocal energy peaks.
+    Zoom factor = 1.0 + (DYNAMIC_ZOOM_MAX − 1.0) × intensity × confidence.
+
+    Parameters
+    ----------
+    vad_segments     : VAD segment dicts (is_voice, confidence, start, end).
+    rhythm_intensity : Strength of the effect (0.0 = off, 1.0 = full).
+
+    Returns
+    -------
+    List of VisualElement with type="zoom" and name="dynamic_zoom".
+    """
+    elements: list[VisualElement] = []
+    max_delta = DYNAMIC_ZOOM_MAX - 1.0   # 0.05
+
+    for seg in vad_segments:
+        if not seg.get("is_voice", False):
+            continue
+        confidence = float(seg.get("confidence", 0.0))
+        if confidence < VAD_CONFIDENCE_THRESHOLD:
+            continue
+
+        zoom = round(1.0 + max_delta * rhythm_intensity * confidence, 4)
+        if zoom <= 1.001:   # below perception threshold — skip
+            continue
+
+        elements.append(VisualElement(
+            type="zoom",
+            start=float(seg.get("start", 0.0)),
+            end=float(seg.get("end", 0.0)),
+            zoom_factor=zoom,
+            anchor_x=0.5,
+            anchor_y=0.5,
+            name="dynamic_zoom",
+        ))
+
+    return elements
+
+
 def _run_designer_sensors(
     result: DesignerResult,
     *,
@@ -558,7 +622,9 @@ def _run_designer_sensors(
             )
 
     for i, elem in enumerate(result.visual_elements):
-        if elem.type == "zoom" and abs(elem.zoom_factor - JUMP_CUT_ZOOM) > 0.001:
+        if (elem.type == "zoom"
+                and elem.name != "dynamic_zoom"   # DynamicZoom has intentional non-1.1 factor
+                and abs(elem.zoom_factor - JUMP_CUT_ZOOM) > 0.001):
             flags.append(
                 f"JUMP_CUT_ZOOM: zoom[{i}] factor={elem.zoom_factor} "
                 f"deviates from spec {JUMP_CUT_ZOOM}"
@@ -635,9 +701,19 @@ def run_designer(
     )
 
     # ── 2. Zoom overlays (jump cuts) ──────────────────────────────────────
-    result.visual_elements.extend(
-        build_zoom_overlays(cut_segments)
-    )
+    jump_zooms = build_zoom_overlays(cut_segments)
+    result.visual_elements.extend(jump_zooms)
+
+    # ── 2b. DynamicZoom — VAD-amplitude-driven subtle zoom pulses ─────────
+    intensity = _read_rhythm_intensity()
+    if intensity > 0.0:
+        jump_zoom_times: set[tuple[float, float]] = {
+            (z.start, z.end) for z in jump_zooms
+        }
+        for dz in build_dynamic_zoom_events(vad_segments, rhythm_intensity=intensity):
+            # Skip if a jump-cut zoom already covers exactly this window
+            if (dz.start, dz.end) not in jump_zoom_times:
+                result.visual_elements.append(dz)
 
     # ── 3. Audio duck events ──────────────────────────────────────────────
     result.visual_elements.extend(

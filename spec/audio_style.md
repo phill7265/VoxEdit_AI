@@ -1,0 +1,10 @@
+# VoxEdit AI — Audio Style
+
+## Ducking
+VOICE_DUCK_DB: -20
+DUCK_ATTACK_MS: 150
+DUCK_RELEASE_MS: 500
+
+## BGM
+BGM_BASE_VOLUME: 0.30
+BGM_STYLE: calm

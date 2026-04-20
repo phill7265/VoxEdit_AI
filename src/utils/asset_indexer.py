@@ -91,12 +91,19 @@ class AssetIndexer:
     Parameters
     ----------
     assets_dir : Override the default assets/broll/ directory (used in tests).
+    generator  : Optional AssetGenerator used as a fallback when find() has no
+                 local match.  Pass None (default) to disable generation.
     """
 
-    def __init__(self, assets_dir: Optional[Path] = None) -> None:
+    def __init__(
+        self,
+        assets_dir: Optional[Path] = None,
+        generator: Optional[object] = None,   # AssetGenerator | None
+    ) -> None:
         self._dir: Path = assets_dir or _DEFAULT_BROLL_DIR
         self._index: dict[str, str] = {}   # keyword (lowercase) → abs_path
         self._built: bool = False
+        self._generator = generator         # AssetGenerator instance or None
 
     # ── Public API ─────────────────────────────────────────────────────────
 
@@ -141,10 +148,14 @@ class AssetIndexer:
 
         Match priority
         --------------
-        1. Exact keyword match
-        2. Prefix match (keyword starts with query, or query starts with keyword)
-        3. Substring containment
-        4. Synonym expansion then exact/prefix/substring retry
+        1. Exact keyword match (local index)
+        2. Prefix match  (local index)
+        3. Substring containment  (local index)
+        4. Synonym expansion then exact/prefix/substring retry  (local index)
+        5. AssetGenerator fallback — calls self._generator.generate(query)
+           only if a generator was provided and all local matches failed.
+           On success, the generated path is injected into the index so
+           subsequent calls for the same keyword are instant.
         """
         if not self._built:
             self.build()
@@ -177,6 +188,14 @@ class AssetIndexer:
             result = self._index.get(rev)
             if result:
                 return result
+
+        # 5. Generator fallback (only if a generator is attached)
+        if self._generator is not None:
+            generated = self._generator.generate(query.strip())
+            if generated:
+                # Cache in index so repeat calls skip generation
+                self._index[q] = generated
+                return generated
 
         return None
 

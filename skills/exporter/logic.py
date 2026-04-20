@@ -35,6 +35,17 @@ logger = logging.getLogger(__name__)
 
 # ── Spec reader ───────────────────────────────────────────────────────────────
 _SPEC_FILE = Path(__file__).resolve().parents[2] / "spec" / "editing_style.md"
+_AUDIO_STYLE_FILE = Path(__file__).resolve().parents[2] / "spec" / "audio_style.md"
+
+
+def _read_audio_style_float(key: str, default: float) -> float:
+    """Read a float value from spec/audio_style.md."""
+    try:
+        text = _AUDIO_STYLE_FILE.read_text(encoding="utf-8")
+        m = re.search(rf"{re.escape(key)}\s*[:=]\s*([+-]?[\d.]+)", text)
+        return float(m.group(1)) if m else default
+    except Exception:
+        return default
 
 
 def _read_spec_int(field: str, default: int) -> int:
@@ -124,6 +135,7 @@ class ExportPlan:
     duck_events: list[dict]
     broll_elements: list[dict] = field(default_factory=list)
     export_profile: dict = field(default_factory=lambda: dict(DEFAULT_PROFILE))
+    bgm_file: Optional[str] = None
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -197,6 +209,9 @@ class ExportPlan:
         parts = ["ffmpeg", f'-i "{src}"']
         for ap in broll_inputs:
             parts.append(f'-i "{ap}"')
+        if self.bgm_file:
+            bgm = self.bgm_file.replace("\\", "/")
+            parts.append(f'-i "{bgm}"')
         parts += [
             f'-filter_complex "{fc}"',
             f'-map "{vout}"',
@@ -206,6 +221,75 @@ class ExportPlan:
             f"-preset {preset}",
             f"-c:a {acodec}",
             f"-s {width}x{height}",
+            f'"{out}"',
+        ]
+        return " ".join(parts)
+
+    def to_audio_only_command(self, prior_video: str) -> str:
+        """Build an FFmpeg command that copies video from prior_video and re-processes audio.
+
+        Approximately 3–5× faster than a full render because video re-encoding is skipped.
+        The audio track is rebuilt from the source file with updated duck/BGM settings.
+
+        Input layout
+        ------------
+        0 : source_file  (for audio trim/concat/duck)
+        1 : bgm_file     (optional, if set)
+        N : prior_video  (for video stream — -c:v copy)
+        """
+        p = self.export_profile
+        acodec = p.get("audio_codec", "aac")
+
+        src = self.source_file.replace("\\", "/")
+        pv = prior_video.replace("\\", "/")
+        out = self.output_file.replace("\\", "/")
+
+        # Build audio-only filter chain (skip all video filters)
+        audio_parts: list[str] = []
+
+        a_trim_parts, a_labels = _build_audio_trim_parts(self)
+        audio_parts.extend(a_trim_parts)
+
+        n = len(a_labels)
+        if n == 1:
+            audio_parts.append(f"{a_labels[0]}anull[acat]")
+            acat = "[acat]"
+        elif n > 1:
+            audio_parts.append(
+                "".join(a_labels) + f"concat=n={n}:v=0:a=1[acat]"
+            )
+            acat = "[acat]"
+        else:
+            acat = "[0:a]"
+
+        bgm_input_idx: Optional[int] = None
+        if self.bgm_file:
+            bgm_input_idx = 1  # input 0=source, input 1=bgm
+
+        duck_filt, a_after_duck = _build_duck_part(self, acat)
+        if duck_filt:
+            audio_parts.append(duck_filt)
+
+        if bgm_input_idx is not None:
+            bgm_parts, a_final = _build_bgm_mix_part(self, a_after_duck, bgm_input_idx)
+            audio_parts.extend(bgm_parts)
+        else:
+            a_final = a_after_duck
+
+        fc = ";".join(audio_parts)
+        prior_idx = 1 + (1 if self.bgm_file else 0)
+
+        parts = ["ffmpeg", f'-i "{src}"']
+        if self.bgm_file:
+            parts.append(f'-i "{self.bgm_file.replace(chr(92), "/")}"')
+        parts.append(f'-i "{pv}"')
+        parts += [
+            f'-filter_complex "{fc}"',
+            f'-map {prior_idx}:v',
+            f'-map "{a_final}"',
+            "-c:v copy",
+            f"-c:a {acodec}",
+            "-shortest",
             f'"{out}"',
         ]
         return " ".join(parts)
@@ -394,18 +478,24 @@ def _build_duck_part(
 ) -> tuple[str, str]:
     """Build a volume filter expression for audio ducking.
 
+    Duck parameters (VOICE_DUCK_DB, DUCK_ATTACK_MS, DUCK_RELEASE_MS) are read
+    from spec/audio_style.md so the user can adjust them via intent commands.
+
     Returns (filter_string, audio_out_label). Returns ("", audio_in) if no duck events.
     """
     if not plan.duck_events:
         return "", audio_in
 
+    # Read per-render duck parameters from spec
+    duck_db = _read_audio_style_float("VOICE_DUCK_DB", DUCK_DB)
+    duck_factor = round(10 ** (duck_db / 20.0), 4)
+
     # Build nested if-expression: if(between(t,S,E),FACTOR,if(between(t,...
-    conditions: list[str] = []
+    conditions: list[tuple[float, float, float]] = []
     for ev in plan.duck_events:
         s = plan.compute_output_time(ev.get("start", 0.0)) or 0.0
         e = plan.compute_output_time(ev.get("end", 0.0)) or 0.0
-        factor = round(DUCK_FACTOR, 4)
-        conditions.append((s, e, factor))
+        conditions.append((s, e, duck_factor))
 
     if not conditions:
         return "", audio_in
@@ -418,6 +508,61 @@ def _build_duck_part(
     out_label = "[aduck]"
     filt = f"{audio_in}volume=volume='{expr}':eval=frame{out_label}"
     return filt, out_label
+
+
+def _build_bgm_mix_part(
+    plan: ExportPlan,
+    audio_in: str,
+    bgm_input_idx: int,
+) -> tuple[list[str], str]:
+    """Build a BGM mixing chain using sidechaincompress + amix.
+
+    The voice signal is used as the sidechain to compress the BGM whenever speech
+    is present, achieving natural-sounding ducking without manual envelope keyframes.
+
+    Filter chain
+    ------------
+    1. BGM volume normalisation via BGM_BASE_VOLUME from audio_style.md.
+    2. Split voice into sidechain copy + passthrough.
+    3. sidechaincompress: BGM attenuated by voice sidechain signal.
+    4. amix: combine voice passthrough + ducked BGM (non-normalised).
+
+    Parameters
+    ----------
+    audio_in       : Label of the voice/main audio stream entering this stage.
+    bgm_input_idx  : FFmpeg input index for the BGM file (e.g. 1 if source=0, bgm=1).
+
+    Returns (filter_parts, output_label).
+    """
+    bgm_vol = round(_read_audio_style_float("BGM_BASE_VOLUME", 0.30), 3)
+    attack_ms = _read_audio_style_float("DUCK_ATTACK_MS", 150)
+    release_ms = _read_audio_style_float("DUCK_RELEASE_MS", 500)
+
+    parts: list[str] = []
+
+    # 1. Normalise BGM level
+    parts.append(
+        f"[{bgm_input_idx}:a]volume={bgm_vol:.3f}[bgm_vol]"
+    )
+
+    # 2. Split voice: sidechain + passthrough
+    parts.append(f"{audio_in}asplit=2[voice_sc][voice_pass]")
+
+    # 3. sidechaincompress — BGM ducked by voice sidechain
+    #    threshold=-24dBFS (≈0.063), ratio=9:1
+    parts.append(
+        "[bgm_vol][voice_sc]sidechaincompress="
+        "threshold=0.063:"
+        "ratio=9:"
+        f"attack={attack_ms:.0f}:"
+        f"release={release_ms:.0f}"
+        "[bgm_sc]"
+    )
+
+    # 4. Mix voice + ducked BGM; normalize=0 keeps individual levels intact
+    parts.append("[voice_pass][bgm_sc]amix=inputs=2:normalize=0[amix_out]")
+
+    return parts, "[amix_out]"
 
 
 def _build_broll_parts(
@@ -486,6 +631,16 @@ def _build_broll_parts(
     return parts, current
 
 
+def _count_unique_broll_inputs(plan: ExportPlan) -> int:
+    """Return the number of unique b-roll input files in the plan."""
+    seen: set[str] = set()
+    for elem in plan.broll_elements:
+        ap = elem.get("asset_path", "")
+        if ap:
+            seen.add(ap)
+    return len(seen)
+
+
 def _compute_labels(plan: ExportPlan) -> tuple[str, str]:
     """Return (final_video_label, final_audio_label) without building the full graph."""
     _, v_labels = _build_video_trim_parts(plan)
@@ -494,6 +649,10 @@ def _compute_labels(plan: ExportPlan) -> tuple[str, str]:
 
     cap_parts, v_after_caps = _build_caption_parts(plan, vcat)
     duck_part, a_after_duck = _build_duck_part(plan, acat)
+
+    if plan.bgm_file:
+        bgm_idx = _count_unique_broll_inputs(plan) + 1
+        _, a_after_duck = _build_bgm_mix_part(plan, a_after_duck, bgm_idx)
 
     return v_after_caps, a_after_duck
 
@@ -528,9 +687,17 @@ def _build_filter_complex(plan: ExportPlan) -> str:
     all_parts.extend(cap_parts)
 
     # 6. Audio duck volume filter
-    duck_filt, a_final = _build_duck_part(plan, acat)
+    duck_filt, a_after_duck = _build_duck_part(plan, acat)
     if duck_filt:
         all_parts.append(duck_filt)
+
+    # 7. BGM mixing via sidechaincompress (when bgm_file is provided)
+    if plan.bgm_file:
+        bgm_idx = _count_unique_broll_inputs(plan) + 1
+        bgm_parts, a_final = _build_bgm_mix_part(plan, a_after_duck, bgm_idx)
+        all_parts.extend(bgm_parts)
+    else:
+        a_final = a_after_duck
 
     logger.info(
         "filter_complex: %d parts | v_out=%s a_out=%s",

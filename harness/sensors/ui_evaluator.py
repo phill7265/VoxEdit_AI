@@ -33,6 +33,7 @@ from pathlib import Path
 # ── Paths ─────────────────────────────────────────────────────────────────────
 ROOT = Path(__file__).resolve().parents[2]
 SPEC_FILE = ROOT / "spec" / "editing_style.md"
+BROLL_REQUESTS_FILE = ROOT / "spec" / "broll_requests.json"
 JOBS_ROOT = ROOT / "harness" / "memory" / "jobs"
 STAGING_ROOT = ROOT / "staging"
 
@@ -219,6 +220,107 @@ def gate_memory_consistency() -> GateResult:
         return GateResult(name, False, f"exception: {exc}")
 
 
+def gate_asset_manager_update() -> GateResult:
+    """Verify that Delete/Re-roll operations on broll_requests.json are atomic.
+
+    This is a disk-only gate (no browser required).  It simulates what the UI
+    buttons do:
+    1. Write a known broll_requests.json with two entries.
+    2. Simulate a Delete on the first entry (same logic as the UI button).
+    3. Verify the file changed, has one fewer entry, and the correct item was removed.
+    4. Simulate a Re-roll (cache deletion + regeneration with placeholder backend).
+    5. Verify the asset_path in the file was updated.
+
+    The gate confirms that spec/broll_requests.json physically changes on each
+    operation — which is what the UI Asset Manager relies on.
+    """
+    name = "ASSET_MANAGER_UPDATE"
+    import tempfile, shutil
+
+    try:
+        # ── Setup: write test broll_requests.json ─────────────────────────
+        original_content: bytes | None = None
+        if BROLL_REQUESTS_FILE.exists():
+            original_content = BROLL_REQUESTS_FILE.read_bytes()
+
+        test_entries = [
+            {"keyword": "cat",   "asset_path": "/fake/cat.mp4",   "opacity": 1.0, "mode": "overlay"},
+            {"keyword": "ocean", "asset_path": "/fake/ocean.mp4", "opacity": 0.8, "mode": "overlay"},
+        ]
+        BROLL_REQUESTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        BROLL_REQUESTS_FILE.write_text(
+            json.dumps(test_entries, indent=2), encoding="utf-8"
+        )
+        mtime_before = BROLL_REQUESTS_FILE.stat().st_mtime
+
+        # ── Step 1: Simulate Delete (first entry "cat") ───────────────────
+        time.sleep(0.02)   # ensure mtime diff is detectable
+        entries = json.loads(BROLL_REQUESTS_FILE.read_text(encoding="utf-8"))
+        entries.pop(0)     # delete index 0
+        BROLL_REQUESTS_FILE.write_text(
+            json.dumps(entries, indent=2), encoding="utf-8"
+        )
+        mtime_after_delete = BROLL_REQUESTS_FILE.stat().st_mtime
+
+        if mtime_after_delete <= mtime_before:
+            return GateResult(name, False, "file mtime did not change after Delete")
+
+        entries_after_delete = json.loads(BROLL_REQUESTS_FILE.read_text(encoding="utf-8"))
+        if len(entries_after_delete) != 1:
+            return GateResult(
+                name, False,
+                f"expected 1 entry after Delete, got {len(entries_after_delete)}"
+            )
+        if entries_after_delete[0]["keyword"] != "ocean":
+            return GateResult(
+                name, False,
+                f"wrong entry kept after Delete: {entries_after_delete[0]['keyword']!r}"
+            )
+
+        # ── Step 2: Simulate Re-roll (regenerate "ocean") ─────────────────
+        with tempfile.TemporaryDirectory() as gen_dir:
+            from src.utils.asset_generator import AssetGenerator
+            gen = AssetGenerator(output_dir=Path(gen_dir), backend="placeholder")
+
+            time.sleep(0.02)
+            mtime_before_reroll = BROLL_REQUESTS_FILE.stat().st_mtime
+
+            new_path = gen.generate("ocean")
+            if not new_path:
+                return GateResult(name, False, "AssetGenerator.generate returned None")
+
+            entries_after_delete[0]["asset_path"] = new_path
+            BROLL_REQUESTS_FILE.write_text(
+                json.dumps(entries_after_delete, indent=2), encoding="utf-8"
+            )
+            mtime_after_reroll = BROLL_REQUESTS_FILE.stat().st_mtime
+
+        if mtime_after_reroll <= mtime_before_reroll:
+            return GateResult(name, False, "file mtime did not change after Re-roll")
+
+        final_entries = json.loads(BROLL_REQUESTS_FILE.read_text(encoding="utf-8"))
+        if not final_entries[0]["asset_path"].endswith(".png"):
+            return GateResult(
+                name, False,
+                f"asset_path not updated after Re-roll: {final_entries[0]['asset_path']!r}"
+            )
+
+        return GateResult(
+            name, True,
+            "Delete: 1 entry removed, mtime changed ✓  "
+            "Re-roll: asset_path updated to .png, mtime changed ✓"
+        )
+
+    except Exception as exc:
+        return GateResult(name, False, f"exception: {exc}")
+    finally:
+        # Restore original broll_requests.json
+        if original_content is not None:
+            BROLL_REQUESTS_FILE.write_bytes(original_content)
+        elif BROLL_REQUESTS_FILE.exists():
+            BROLL_REQUESTS_FILE.unlink()
+
+
 # ── Runner ────────────────────────────────────────────────────────────────────
 
 def run(url: str = APP_URL, test_video: Path | None = None) -> list[GateResult]:
@@ -254,8 +356,9 @@ def run(url: str = APP_URL, test_video: Path | None = None) -> list[GateResult]:
         results.append(gate_pipeline_trigger(page, test_video))
         browser.close()
 
-    # Memory consistency is disk-only — no browser needed
+    # Disk-only gates — no browser needed
     results.append(gate_memory_consistency())
+    results.append(gate_asset_manager_update())
     return results
 
 

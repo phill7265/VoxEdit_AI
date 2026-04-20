@@ -296,11 +296,15 @@ class TestAutoFillIntent(unittest.TestCase):
 
     def test_no_matching_assets_returns_applied_false(self):
         from src.pipeline.intent_processor import IntentProcessor
+        from src.utils import asset_generator as ag_mod
         words = [{"word": "헬리콥터", "start": 0, "end": 1000}]
         with tempfile.TemporaryDirectory() as d:
+            # Patch both local dir (no files) AND generator (returns None)
+            # so the test confirms applied=False when all sources fail.
             with patch("src.pipeline.intent_processor._load_latest_transcript_words",
                        return_value=words), \
-                 patch("src.utils.asset_indexer._DEFAULT_BROLL_DIR", Path(d)):
+                 patch("src.utils.asset_indexer._DEFAULT_BROLL_DIR", Path(d)), \
+                 patch.object(ag_mod.AssetGenerator, "generate", return_value=None):
                 p = IntentProcessor()
                 r = p.process("자료화면 자동으로 채워줘")
                 self.assertFalse(r.applied)

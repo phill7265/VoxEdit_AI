@@ -25,6 +25,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 SPEC_FILE = ROOT / "spec" / "editing_style.md"
+BROLL_REQUESTS_FILE = ROOT / "spec" / "broll_requests.json"
 JOBS_ROOT = ROOT / "harness" / "memory" / "jobs"
 STAGING_ROOT = ROOT / "staging"
 
@@ -399,6 +400,7 @@ if chat_input:
                 "cutter": "편집(Cutter)부터",
                 "designer": "디자인(Designer)부터",
                 "exporter": "렌더링(Exporter)만",
+                "designer_fast": "B-roll 패치 후 렌더링(Micro-Resume)",
             }.get(result.restart_from, result.restart_from)
 
             reply = (
@@ -408,3 +410,88 @@ if chat_input:
 
         st.session_state["chat_history"].append({"role": "assistant", "content": reply})
         st.rerun()
+
+
+# ══ B-roll 자산 관리자 ══════════════════════════════════════════════════════════
+st.divider()
+st.subheader("B-roll 자산 관리")
+st.caption("현재 주입된 자료화면 목록. 각 항목을 재생성하거나 삭제할 수 있습니다.")
+
+
+def _read_broll_requests() -> list[dict]:
+    if not BROLL_REQUESTS_FILE.exists():
+        return []
+    try:
+        return json.loads(BROLL_REQUESTS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+
+def _write_broll_requests(requests: list[dict]) -> None:
+    BROLL_REQUESTS_FILE.write_text(
+        json.dumps(requests, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+def _trigger_micro_resume() -> None:
+    """Fire a designer_fast Smart Resume in a background thread."""
+    source_path = st.session_state.get("source_path")
+    prior_job_id, prior_records = _find_latest_complete_job()
+    if not source_path or not prior_job_id:
+        return
+    new_job_id = f"job_{time.strftime('%Y%m%d_%H%M%S')}"
+    staging_dir = STAGING_ROOT / new_job_id
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    _write_status(new_job_id, done=False, error=None, output_path=None)
+    st.session_state["job_id"] = new_job_id
+    threading.Thread(
+        target=_run_smart_resume,
+        args=(new_job_id, source_path, staging_dir, "designer_fast", prior_records),
+        daemon=True,
+    ).start()
+
+
+broll_items = _read_broll_requests()
+
+if not broll_items:
+    st.info("주입된 B-roll 에셋이 없습니다. 채팅창에 '자료화면 자동으로 채워줘'를 입력해 보세요.")
+else:
+    for i, req in enumerate(broll_items):
+        keyword = req.get("keyword", "?")
+        asset_path = req.get("asset_path", "")
+        asset_name = Path(asset_path).name if asset_path else "(경로 없음)"
+        opacity = req.get("opacity", 1.0)
+        is_generated = "generated" in asset_path.replace("\\", "/")
+        badge = "🤖" if is_generated else "📁"
+
+        col_info, col_reroll, col_del = st.columns([4, 1, 1])
+        with col_info:
+            st.markdown(
+                f"**{i+1}.** {badge} `{keyword}` — {asset_name} "
+                f"(투명도: {opacity:.0%})"
+            )
+
+        with col_reroll:
+            if st.button("🔄 재생성", key=f"reroll_{i}", use_container_width=True):
+                from src.utils.asset_generator import AssetGenerator
+                gen = AssetGenerator()
+                # Delete cache so generator forces a fresh run
+                cached = gen.cache_path(keyword)
+                if cached.exists():
+                    cached.unlink()
+                new_path = gen.generate(keyword)
+                if new_path:
+                    broll_items[i]["asset_path"] = new_path
+                    _write_broll_requests(broll_items)
+                    _trigger_micro_resume()
+                    st.success(f"'{keyword}' 재생성 완료 → {Path(new_path).name}")
+                else:
+                    st.error(f"'{keyword}' 재생성 실패")
+                st.rerun()
+
+        with col_del:
+            if st.button("🗑 삭제", key=f"delete_{i}", use_container_width=True):
+                broll_items.pop(i)
+                _write_broll_requests(broll_items)
+                _trigger_micro_resume()
+                st.rerun()

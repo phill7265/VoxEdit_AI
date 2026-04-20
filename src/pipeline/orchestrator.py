@@ -25,12 +25,16 @@ on each call to run().
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 from harness.memory.manager import MemoryManager, SkillRecord, SKILL_ORDER
+
+_ROOT = Path(__file__).resolve().parents[2]
+_BROLL_REQUESTS_FILE = _ROOT / "spec" / "broll_requests.json"
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +140,14 @@ class WorkflowManager:
         -------
         PipelineResult with status "success" or "failed".
         """
+        # ── Micro-Resume fast paths ────────────────────────────────────────
+        if self.force_resume_from == "designer_fast":
+            return self._run_micro_resume()
+        if self.force_resume_from == "audio_only":
+            return self._run_audio_only()
+        if self.force_resume_from == "visual_fast":
+            return self._run_visual_fast()
+
         mgr = MemoryManager(self.job_id)
         resume = mgr.find_resume_point()
 
@@ -244,6 +256,338 @@ class WorkflowManager:
             self.force_resume_from, list(resume.completed), resume.cursor,
         )
         return resume
+
+    # ── Micro-Resume (designer_fast) ────────────────────────────────────────
+
+    def _run_micro_resume(self) -> PipelineResult:
+        """Micro-Resume: patch b-roll elements only, skip to Exporter.
+
+        Flow
+        ----
+        1. Load prior annotated_timeline.json from borrow_records['designer'].
+        2. Replace ALL b-roll elements with fresh ones from broll_requests.json.
+        3. Write the patched timeline to this job's staging directory.
+        4. Write placeholder SkillRecords for transcriber, cutter, designer.
+        5. Run ONLY the Exporter skill.
+
+        Falls back to force_resume_from='exporter' if prior records are missing.
+        """
+        designer_rec = self.borrow_records.get("designer")
+        if designer_rec is None:
+            logger.warning(
+                "Micro-resume: no prior designer record for job '%s' — "
+                "falling back to exporter-only resume",
+                self.job_id,
+            )
+            self.force_resume_from = "exporter"
+            return self.run()
+
+        patched_path = self._patch_broll_in_timeline(designer_rec)
+        if patched_path is None:
+            logger.warning(
+                "Micro-resume: timeline patch failed for job '%s' — "
+                "falling back to exporter-only resume",
+                self.job_id,
+            )
+            self.force_resume_from = "exporter"
+            return self.run()
+
+        # Update borrow_records so exporter sees the patched timeline
+        patched_designer = SkillRecord(
+            job_id=self.job_id,
+            skill="designer",
+            status="success",
+            output_path=str(patched_path),
+            cursor_start=designer_rec.cursor_start,
+            cursor_end=designer_rec.cursor_end,
+            payload={"fast_resume": True},
+        )
+        self.borrow_records["designer"] = patched_designer
+
+        # Write borrowed placeholder records to this job's memory dir
+        mgr = MemoryManager(self.job_id)
+        for skill in ("transcriber", "cutter", "designer"):
+            src = self.borrow_records.get(skill)
+            if src is None:
+                continue
+            placeholder = SkillRecord(
+                job_id=self.job_id,
+                skill=skill,
+                status="success",
+                output_path=src.output_path,
+                cursor_start=src.cursor_start,
+                cursor_end=src.cursor_end,
+                payload={"borrowed_from_job": src.job_id, "fast_resume": True},
+            )
+            mgr.write(placeholder)
+
+        # Resume from exporter
+        resume = mgr.find_resume_point()
+        result = PipelineResult(
+            job_id=self.job_id,
+            status="success",
+            skipped=["transcriber", "cutter", "designer"],
+            records=dict(resume.records),
+        )
+
+        if resume.is_complete:
+            result.completed = list(resume.completed)
+            result.final_record = resume.records.get(SKILL_ORDER[-1])
+            return result
+
+        current_cursor = resume.cursor
+        record = self._run_skill("exporter", current_cursor, resume)
+        result.records["exporter"] = record
+        result.final_record = record
+
+        if record.status != "success":
+            result.status = "failed"
+            result.failed_skill = "exporter"
+            logger.error(
+                "Micro-resume: exporter failed — job='%s'  error=%s",
+                self.job_id, record.error,
+            )
+        else:
+            result.completed = ["exporter"]
+            logger.info(
+                "Micro-resume complete — job='%s'  skipped=3 skills  "
+                "patched_timeline=%s",
+                self.job_id, patched_path.name,
+            )
+        return result
+
+    def _patch_broll_in_timeline(self, designer_rec: SkillRecord) -> Optional[Path]:
+        """Replace b-roll elements in the prior annotated_timeline.json.
+
+        Reads the current broll_requests.json, rebuilds VisualElement objects,
+        and writes a patched timeline to this job's staging directory.
+        Returns the path of the patched file, or None on any error.
+        """
+        try:
+            prior_path = Path(designer_rec.output_path)
+            if not prior_path.exists():
+                logger.error(
+                    "Micro-resume: prior timeline not found: %s", prior_path
+                )
+                return None
+
+            timeline = json.loads(prior_path.read_text(encoding="utf-8"))
+            existing = timeline.get("visual_elements", [])
+
+            # Total duration from existing elements (needed by build_broll_elements)
+            total_s = max(
+                (e.get("end", 0.0) for e in existing), default=30.0
+            )
+
+            # Load current broll requests
+            broll_requests: list[dict] = []
+            if _BROLL_REQUESTS_FILE.exists():
+                broll_requests = json.loads(
+                    _BROLL_REQUESTS_FILE.read_text(encoding="utf-8")
+                )
+
+            from skills.designer.logic import build_broll_elements
+            new_brolls = build_broll_elements(
+                broll_requests, total_duration_s=total_s
+            )
+
+            # Keep everything except b-roll, then append fresh b-roll elements
+            non_broll = [e for e in existing if e.get("type") != "b-roll"]
+            timeline["visual_elements"] = non_broll + [
+                b.to_dict() for b in new_brolls
+            ]
+            if "metadata" in timeline:
+                timeline["metadata"]["broll_count"] = len(new_brolls)
+
+            # Write patched timeline to this job's staging directory
+            staging = self.staging_dir
+            if staging is None:
+                staging = _ROOT / "staging" / self.job_id
+            staging.mkdir(parents=True, exist_ok=True)
+
+            out_path = staging / "annotated_timeline.json"
+            out_path.write_text(
+                json.dumps(timeline, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            logger.info(
+                "Micro-resume: patched timeline → %s  "
+                "non_broll=%d  new_brolls=%d",
+                out_path.name, len(non_broll), len(new_brolls),
+            )
+            return out_path
+
+        except Exception as exc:
+            logger.error("Micro-resume: _patch_broll_in_timeline failed — %s", exc)
+            return None
+
+    # ── Visual-Fast Resume (designer + exporter, ultrafast encoding) ────────
+
+    def _run_visual_fast(self) -> PipelineResult:
+        """Visual-fast resume: re-run Designer + Exporter with ultrafast preset.
+
+        Use case
+        --------
+        Only visual parameters changed (RHYTHM_INTENSITY, zoom style, etc.).
+        Transcriber and Cutter outputs are unchanged — borrow them.
+
+        Flow
+        ----
+        1. Override export_profile with ``preset="ultrafast"`` and ``crf=28``
+           for ~3× faster encoding (preview quality).
+        2. Fall through to standard ``force_resume_from="designer"`` which
+           calls ``_apply_force_resume`` and borrows transcriber + cutter.
+
+        Falls back gracefully when borrow_records is empty (runs from scratch).
+        """
+        from skills.exporter.logic import DEFAULT_PROFILE
+        if self.export_profile is None:
+            self.export_profile = dict(DEFAULT_PROFILE)
+        self.export_profile["preset"] = "ultrafast"
+        self.export_profile["crf"] = 28
+
+        self.force_resume_from = "designer"
+        return self.run()
+
+    # ── Audio-Only Resume ───────────────────────────────────────────────────
+
+    def _run_audio_only(self) -> PipelineResult:
+        """Audio-only resume: skip video encoding, re-mux audio with -c:v copy.
+
+        Flow
+        ----
+        1. Load prior exporter output (rendered video) from borrow_records['exporter'].
+        2. Load keep_segments from borrow_records['cutter'] and duck_events from
+           borrow_records['designer'].
+        3. Build an ExportPlan carrying only audio filters (no captions, no b-roll).
+        4. Call plan.to_audio_only_command(prior_video) which uses -c:v copy.
+        5. Run exporter skill with the pre-built command (or validate in dry_run mode).
+
+        Falls back to force_resume_from='exporter' if prior records are missing.
+        Approximately 3–5× faster than a full render.
+        """
+        exporter_rec = self.borrow_records.get("exporter")
+        cutter_rec   = self.borrow_records.get("cutter")
+        designer_rec = self.borrow_records.get("designer")
+
+        if exporter_rec is None or not exporter_rec.output_path:
+            logger.warning(
+                "audio_only: no prior exporter record for job '%s' — "
+                "falling back to exporter-only resume",
+                self.job_id,
+            )
+            self.force_resume_from = "exporter"
+            return self.run()
+
+        prior_video = Path(exporter_rec.output_path)
+        if not prior_video.exists() and not self.dry_run:
+            logger.warning(
+                "audio_only: prior video not found '%s' for job '%s' — "
+                "falling back to exporter-only resume",
+                prior_video, self.job_id,
+            )
+            self.force_resume_from = "exporter"
+            return self.run()
+
+        # Derive staging directory
+        staging = self.staging_dir
+        if staging is None:
+            staging = _ROOT / "staging" / self.job_id
+        staging = Path(staging)
+        staging.mkdir(parents=True, exist_ok=True)
+
+        output_path = staging / "output_audio_only.mp4"
+
+        # Load keep_segments from cutter record
+        keep_segments: list[dict] = []
+        if cutter_rec and cutter_rec.output_path:
+            try:
+                data = json.loads(Path(cutter_rec.output_path).read_text(encoding="utf-8"))
+                keep_segments = [s for s in data.get("segments", []) if s.get("action") == "keep"]
+            except Exception as exc:
+                logger.warning("audio_only: could not load cut_list from cutter record — %s", exc)
+
+        # Load duck_events from designer record
+        duck_events: list[dict] = []
+        if designer_rec and designer_rec.output_path:
+            try:
+                data = json.loads(Path(designer_rec.output_path).read_text(encoding="utf-8"))
+                duck_events = [e for e in data.get("visual_elements", []) if e.get("type") == "duck"]
+            except Exception as exc:
+                logger.warning("audio_only: could not load duck_events from designer record — %s", exc)
+
+        from skills.exporter.logic import ExportPlan, DEFAULT_PROFILE
+        plan = ExportPlan(
+            source_file=self.source_file,
+            output_file=str(output_path),
+            keep_segments=keep_segments,
+            captions=[],
+            zoom_elements=[],
+            duck_events=duck_events,
+            broll_elements=[],
+            export_profile=self.export_profile or dict(DEFAULT_PROFILE),
+        )
+
+        cmd = plan.to_audio_only_command(str(prior_video))
+
+        # Write placeholder records for skipped skills
+        mgr = MemoryManager(self.job_id)
+        for skill in ("transcriber", "cutter", "designer"):
+            src = self.borrow_records.get(skill)
+            if src is None:
+                continue
+            placeholder = SkillRecord(
+                job_id=self.job_id,
+                skill=skill,
+                status="success",
+                output_path=src.output_path,
+                cursor_start=src.cursor_start,
+                cursor_end=src.cursor_end,
+                payload={"borrowed_from_job": src.job_id, "audio_only": True},
+            )
+            mgr.write(placeholder)
+
+        if self.dry_run:
+            # Validate only — return a synthetic success record
+            exporter_out = SkillRecord(
+                job_id=self.job_id,
+                skill="exporter",
+                status="success",
+                output_path=str(output_path),
+                cursor_start="00:00:00.000",
+                cursor_end="00:00:00.000",
+                payload={"audio_only_cmd": cmd, "dry_run": True},
+            )
+            mgr.write(exporter_out)
+        else:
+            import importlib
+            mod = importlib.import_module(_SKILL_MODULES["exporter"])
+            resume = mgr.find_resume_point()
+            exporter_out = mod.run(
+                job_id=self.job_id,
+                source_file=self.source_file,
+                cursor=resume.cursor,
+                staging_dir=staging,
+                dry_run=False,
+                audio_only_cmd=cmd,
+                **self.skill_overrides.get("exporter", {}),
+            )
+
+        result = PipelineResult(
+            job_id=self.job_id,
+            status="success" if exporter_out.status == "success" else "failed",
+            skipped=["transcriber", "cutter", "designer"],
+            completed=["exporter"] if exporter_out.status == "success" else [],
+            failed_skill="exporter" if exporter_out.status != "success" else None,
+            records={"exporter": exporter_out},
+            final_record=exporter_out,
+        )
+
+        logger.info(
+            "audio_only resume complete — job='%s'  output=%s  skipped=3 skills",
+            self.job_id, output_path.name,
+        )
+        return result
 
     # ── Skill dispatch ──────────────────────────────────────────────────────
 

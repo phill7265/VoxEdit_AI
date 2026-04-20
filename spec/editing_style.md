@@ -103,3 +103,12 @@ These are the pass/fail conditions checked by `harness/sensors/` after each skil
 | CAPTION_Y_PX: 768 | Default subtitle Y coordinate (84% of 1920px height) |
 HIGHLIGHT_COLOR: #FFD700
 CAPTION_COLOR: #FFFFFF
+
+## 7. Dynamic Visual Rhythm
+
+| Parameter | Value |
+|-----------|-------|
+| RHYTHM_INTENSITY | 0.50 (range 0.0–1.0; controls DynamicZoom strength) |
+RHYTHM_INTENSITY: 0.50
+ZOOM_FOCUS_ENABLED: false
+CAPTION_FONT_SIZE_PT: 86
